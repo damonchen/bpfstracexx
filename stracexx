@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+# coding=utf-8
+
+# author: damonchen
+# date: 2021-01-05
+# translate from perl implement to python implement
+
+# bpftrace -l '*sleep*'
+# bpftrace -lv 'probe'        # show probe parameters
+
+
+import os
+import sys
+import platform
+import subprocess
+import re
+import argparse
+import tempfile
+import signal
+import shutil
+import atexit
+from pathlib import Path
+
+strace_proc = None
+tmpdir = None
+
+def remove_tempdir():
+    global tmpdir
+    if tmpdir:
+        dir = tempfile.gettempdir()
+        if tmpdir.startswith(dir):
+            # this is a danger operator, so must check the tmpdir is in /tmp
+            shutil.rmtree(tmpdir)
+
+
+atexit.register(remove_tempdir)
+
+
+def kill_strace(sig, frame):
+    global strace_proc
+    if strace_proc is not None:
+        strace_proc.kill()
+    sys.exit(strace_proc.returncode)
+
+
+signal.signal(signal.SIGINT, kill_strace)
+
+
+def cmd_run(cmd, stdin=None):
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate(stdin)
+    return stdout.decode('utf-8'), stderr.decode('utf-8')
+
+
+def die(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.exit(1)
+
+
+def warn(*args, **kwargs):
+    print(*args, **kwargs)
+
+
+def verbose_out(*args, **kwargs):
+    if verbose:
+        print('verbose:', end='')
+        print(*args, **kwargs)
+
+
+def get_stat_files():
+    return [str(p) for p in Path("/proc").glob("[0-9]*/stat")]
+
+
+def get_child_processes(pid):
+    pattern = re.compile(r'^(\d+) \S+ \S+ (\d+)')
+    children = []
+    files = get_stat_files()
+
+    for file in files:
+        if file.startswith(f'/proc/{pid}'):
+            continue
+
+        with open(file, 'r') as fp:
+            for line in fp:
+                match = pattern.match(line)
+                if match:
+                    child, parent = match.groups()
+                    if int(parent) == pid:
+                        children.append(child)
+    children = sorted(children)
+    return children
+
+
+def read_src_file(file):
+    with open(file, "r") as fp:
+        return fp.read()
+
+
+def gen_pid_test_condition(pids=None):
+    if not pids:
+        return "pid == target()"
+
+    c = []
+    for pid in pids:
+        c.append(f"pid == {pid}")
+    return "(" + " || ".join(c) + ")"
+
+
+def process_dso(pid):
+    maps_file = f"/proc/{pid}/maps"
+    pattern = re.compile(r'\S+\.so(?:\.\d+)*$')
+    with open(maps_file, "r") as fp:
+        for line in fp:
+            match = pattern.match(line)
+            if match:
+                path = match.groups()[0]
+                dsos[path] = True
+
+    for path in sorted(dsos.keys()):
+        strace_opts.append("-d")
+        strace_opts.append(path)
+
+
+def quote_sh_args(args):
+    pattern = re.compile(r'^[- "&%;,|?*.+=\w:/()]*$')
+    arg_pattern = re.compile(r'[ "&%;,|?*()]')
+
+    args_ret = []
+    for arg in args:
+        match = pattern.match(arg)
+        if match:
+            if arg_pattern.match(arg):
+                arg = f"'{arg}'"
+                args_ret.append(arg)
+                continue
+
+        arg = arg.replace('\\', '\\\\')
+        arg = re.sub("'", "\\'", arg)
+        arg = re.sub("\n", "\\n", arg)
+        arg = re.sub("\r", "\\r", arg)
+        arg = re.sub("\t", "\\t", arg)
+
+        args_ret.append(arg)
+
+    return args_ret
+
+
+def eval_usr_var_line(line_no):
+    def eval_usr_var(file, user_vars, var):
+        if user_vars[var]:
+            return user_vars[var]
+
+        die(f'{file}: line {line_no}: Undefined user variable \$*{var}.\n')
+        sys.exit(1)
+
+    return eval_usr_var
+
+
+def eval_std_var_line(file, line_no):
+    def eval_std_var(variable, trait_name, trait_val):
+        used_std_vars[variable] = True
+
+        if std_vars.get(variable):
+            return std_vars[variable]
+
+        pattern = re.compile(r'^arg_(\w+)$')
+        match = pattern.match(variable)
+
+        if trait_name:
+            if trait_name == 'default':
+                if print_args and match:
+                    used_args[match.groups()[0]] = trait_val
+
+                std_vars[variable] = trait_val
+                return trait_val
+            else:
+                die(f'{file}: line: {line_no}: unknown trait name: {trait_name}\n')
+
+        if print_args:
+            if match:
+                used_args[match.groups()[0]] = None
+            return ''
+
+        path_pattern = re.compile(r'^(lib\w+)_path$')
+        path_match = path_pattern.match(variable)
+
+        if variable == 'exec_path':
+            die(f'{file}: line: {line_no}: $^exec_path is used but neither -x <pid> '
+                'nor --exec <path> is specified.\n')
+            sys.exit(1)
+        elif matched:
+            v = matched.groups()[0]
+            die(f'{file}: line:{line_no} $^{variable} is used but no --arg {v}=VAL option is specified.\n')
+        elif path_match:
+            prefix = path_match.groups()[0]
+            lib_path = find_dso_path(prefix)
+            if not lib_path:
+                pass
+            return lib_path
+        else:
+            die(f'{file}: line: {line}: Undefined built-in variable \$^$var.\n')
+
+    return eval_std_var
+
+
+def find_dso_path(prefix):
+    path = lib_paths[prefix]
+    if path:
+        return path
+
+    pattern = re.compile(r'^lib(\S+)')
+    match = pattern.match(prefix)
+    if not match:
+        die(f"Bad pattern: {prefix}")
+
+    name = match.groups()[0]
+
+    found_path = ''
+    lib_pattern = re.compile(rf'\blib\Q{name}\E[-.\d]*\.so(?:\.\d+)*$')
+    lib_pattern2 = re.compile(rf'\b(?:lib)?\Q{name}\E[-.\d]*\.so(?:\.\d+)*$')
+
+    for path in sorted(dsos.keys()):
+        match = lib_pattern.match(path)
+        if match:
+            lib_paths[prefix] = path
+            found_path = path
+            warn(f"found exact match for {prefix}: {path}\n")
+            break
+
+        match = lib_pattern2.match(path)
+        if match:
+            if found_path:
+                warn(f"Ignored ambiguous library {path} for \"{prefix}\"")
+                continue
+
+            lib_paths[prefix] = path
+            found_path = path
+
+    return found_path
+
+
+def use_libs_line(line_no):
+    def use_libs(file, libs):
+        verbose_out(f"libs {libs}")
+        pattern = re.compile(r'\s*,\s*')
+        libs = pattern.split(libs)
+
+        for lib in libs:
+            verbose_out(f"processing {lib}")
+            path = "/".join(lib.split('.')) + ".sxx"
+
+            found = False
+            for dir in inc:
+                abspath = os.path.join(dir, path)
+                verbose_out(f"testing {abspath}")
+                if os.path.exists(abspath):
+                    src = read_src_file(abspath)
+                    used_libs[lib] = process_src(abspath, src)
+                    found = True
+                    break
+            if not found:
+                die(f'{file}: line: {line_no}: cannot find use library {lib}')
+        return ""
+
+    return use_libs
+
+
+def process_src(file, src):
+    usr_vars = {}
+    bits = []
+
+    lines = src.split('\n')
+    sebang_pattern = re.compile(r'^\#!')
+
+    for line_no, line in enumerate(lines, start=1):
+        if line_no == 1 and sebang_pattern.match(line):
+            bits.append('#!/usr/bin/env bpftrace')
+            continue
+
+        eval_std_var = eval_std_var_line(file, line_no)
+
+        def eval_std_var_match(matchobj):
+            variable, trait_name, trait_val = matchobj.groups()
+            return eval_std_var(variable, trait_name, trait_val)
+
+        line = re.sub(r'\$\^(arg_\w+)(?:\s*:(\w+)\s*\((.*?)\))?', eval_std_var_match, line)
+
+
+        # def process_function_match(matchobj):
+        #     function = matchobj.groups()[0]
+        #     return f'uprobe:"$^exec_path":{function}'
+
+        # line = re.sub(r'\@pfunc\s*\(\s*(\w+)\s*\)', process_function_match, line)
+
+        def println_function_match(matchobj):
+            function = matchobj.groups()[0]
+            return f'print("{function}")'
+
+        print('line', line)
+        line = re.sub(r'prinln\s*\(\s*(.*)\s*\)', println_function_match, line)
+
+        def process_function_match(matchobj):
+            function = matchobj.groups()[0]
+            return f'uprobe:"$^exec_path":{function}'
+
+        line = re.sub(r'\@pfunc\s*\(\s*(\w+)\s*\)', process_function_match, line)
+
+        def kernel_function_match(matchobj):
+            function = matchobj.groups()[0]
+            return f'kprobe:{function}'
+
+        line = re.sub(r'\@k\s*\(\s*(\w+)\s*\)', kernel_function_match, line)
+
+        def kernel_function_match(matchobj):
+            function = matchobj.groups()[0]
+            return f'kfunc:{function}'
+
+        line = re.sub(r'\@kf\s*\(\s*(\w+)\s*\)', kernel_function_match, line)
+
+        def tracepoint_function_match(matchobj):
+            function = matchobj.groups()[0]
+            return f'tracepoint:{function}'
+        line = re.sub(r'\@t\s*\(\s*(\w+)\s*\)', kernel_function_match, line)
+
+
+        line = re.sub(r'\$\^(\w+|lib[-.\w]+_path)(?:\s*:(\w+)\s*\((.*?)\))?', eval_std_var_match, line)
+
+        def cast_var(matchobj):
+            key, value = matchobj.groups()
+            usr_vars[key] = value
+            return ""
+
+        line = re.sub(r'\$\*(\w+)\s*:=\s*(\&?\@(?:cast|var)\(.*?\)(?:\[\d+\])?)', cast_var, line)
+
+        eval_usr_var = eval_usr_var_line(line_no)
+
+        def eval_user_var_match(matchobj):
+            variable = matchobj.groups()[0]
+            return eval_usr_var(file, usr_vars, variable)
+
+        line = re.sub(r'\$\*(\w+)', eval_user_var_match, line)
+
+        use_libs = use_libs_line(line_no)
+
+        p = r'@use\s+((?:\w+(?:\.\w+)*)(?:\s*,\s*(?:\w+(?:\.\w+)*))*)'
+        matched = re.search(p, line)
+        if matched:
+            libs = matched.groups()[0]
+            line = use_libs(file, libs)
+
+        bits.append(line)
+
+    return '\n'.join(bits)
+
+
+def find_bin():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_trace():
+    traces = []
+    names = ['bpftrace']
+    path = os.environ['PATH']
+    paths = path.split(':')
+    for path in paths:
+        for name in names:
+            path_name = os.path.join(path, name)
+            if os.path.exists(path_name):
+                traces.append(path_name)
+
+    if len(traces) > 0:
+        return traces[0]
+    return None
+
+
+def str2bool(val):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+parser = argparse.ArgumentParser(prog='strace++', epilog='''Examples:
+strace++ -x 12345 -e 'probe begin { println("hello") exit() }'
+strace++ -x 12345 infile.sx
+''', formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument('-c', help='start the probes, run CMD, and exit when it finishes.', dest='shcmd')
+parser.add_argument('-l', help='list bpftrace probe', type=str2bool, dest='list_probes', nargs='?', const=True,
+                    default=False)
+parser.add_argument('-s', help='symbol of exec.', dest='symbol', type=str2bool, nargs='?', const=True,
+                    default=False)
+parser.add_argument('--arg', help='Specify extra user arguments (for $^arg_NM).', dest='args', action='append')
+parser.add_argument('--args', help='Print all available arguments for --arg.', dest='print_args')
+parser.add_argument('--dump-src', help='dump source', dest='dump_src', type=str2bool, nargs='?', const=True,
+                    default=False)
+parser.add_argument('--sample-pid', help='Sample process to inspect DSO objects to load via -d.', dest='sample_pid',
+                    type=int)
+parser.add_argument('--exec', help='Specify the executable file path to be traced.', dest='exec_path', type=str)
+parser.add_argument('--master', help='Specify the master pid whose child processes are traced.', dest='master_pid',
+                    type=int)
+parser.add_argument('-x', help='Sets target() to PID (also for $^exec_path and $^libxxx_path).', dest='pid')
+parser.add_argument('-e', help='Run given script.', dest='src', type=str)
+# parser.add_argument('--help', help='Print this help.')
+parser.add_argument('-v', help='Be verbose.', dest='verbose', type=str2bool, nargs='?', const=True,
+                    default=False)
+parser.add_argument('-skip-badvars', help='Be verbose.', default=False, dest='skip_badvars')
+parser.add_argument('-I', help='Specify the strace++ tapset library search directory.', dest='inc', action='append')
+parser.add_argument('--version', help='version', action='version', version='%(prog)s 0.0.1')
+parser.add_argument('filename', nargs='?')
+
+args = parser.parse_args()
+
+shcmd = args.shcmd
+_args = args.args if args.args else []
+print_args = args.print_args
+dump_src = args.dump_src
+sample_pid = args.sample_pid
+exec_path = args.exec_path
+master_pid = args.master_pid
+list_probes = args.list_probes
+pid = args.pid
+src = args.src
+verbose = args.verbose
+skip_badvars = args.skip_badvars
+inc = args.inc if args.inc else []
+infile = args.filename
+symbol = args.symbol
+
+args = {}
+assign = re.compile(r'^[\'"]?(\S+?)\s*=\s*(\S+?)[\'"]?$')
+for arg in _args:
+    matched = assign.match(arg)
+    if matched:
+        key, value = matched.groups()
+        args[key] = value
+    else:
+        die(f"arg '{arg}' not valid format, should use '--arg key=value' ")
+
+inc.append('.')
+bin_path = find_bin()
+inc.append(f'{bin_path}/tapset')
+
+set_D_opts = {}
+
+std_vars = {}
+used_libs = {}
+dsos = {}
+lib_paths = {}
+used_std_vars = {}
+strace_opts = []
+used_args = {}
+
+system = platform.system().lower()
+if system != 'linux':
+    die(f'Only linux is supported but I am on {system}')
+
+if print_args and args:
+    die('No --arg is allowed when --args is specified.\n')
+
+
+trace_cmd = find_trace()
+if not trace_cmd:
+    die("Error: bpftrace not exists, run 'sudo apt-get install bpftrace-tools' in ubuntu")
+
+ver = ''
+try:
+    ver, _ = cmd_run([trace_cmd, '-V', '2>&1'])
+except OSError as e:
+    die(f'Bpftrace not installed or its "strace" utility is not visible to the PATH environment: {e}\n')
+
+version = re.compile(r'bpftrace\s+v(\d+\.\d+.\d+)', re.I)
+matched = version.search(ver)
+if matched:
+    v = matched.groups()[0]
+    min_ver = '0.11'
+    if v < min_ver:
+        die(f'ERROR: at least bpfstrace {min_ver} is required but found {v}\n')
+else:
+    die(f"ERROR: unknown version of bpfstrace:\n{ver}\n")
+
+
+if symbol:
+    if not exec_path:
+        dir(f"ERROR: -exec should given")
+
+    if not os.path.exists(exec_path):
+        die(f"{exec_path} not found \n")
+    try:
+        content, _ = cmd_run(['objdump', '-tT', exec_path])
+        lines = content.split('\n')
+        names = []
+        for line in lines:
+            fields = line.split()
+            if fields:
+                names.append(fields[-1])
+        print('\n'.join(names))
+        die("")
+    except OSError as e:
+        die(f'objdump not exists or its "{exec_path}" is not visible to the PATH environment: {e}\n')
+
+
+# if d_opts:
+#     opt_pattern = re.compile('^([_A-Z]+)=')
+#     for opt in D_opts:
+#         match = opt_pattern.match(opt)
+#         if match:
+#             set_D_opts[match.groups()[0]] = True
+
+# if 'MAXACTION' not in set_D_opts:
+#     d_opts.append('MAXACTION=100000')
+# if 'MAXMAPENTRIES' not in set_D_opts:
+#     d_opts.append('MAXMAPENTRIES=5000')
+# if 'MAXBACKTRACE' not in set_D_opts:
+#     d_opts.append('MAXBACKTRACE=200')
+
+if not src:
+    if not infile:
+        die("No input file specified.\n")
+    src = read_src_file(infile)
+else:
+    infile = '-e'
+
+if verbose:
+    strace_opts.append("-v")
+
+# if d_opts:
+#     for opt in d_opts:
+#         strace_opts.append('-d')
+#         strace_opts.append(opt)
+
+if skip_badvars:
+    strace_opts.append('--skip-badvars')
+
+# for opt in D_opts:
+#     strace_opts.append(f'-D{opt}')
+
+if exec_path:
+    if not os.path.exists(exec_path):
+        die(f"{exec_path} not found \n")
+
+    std_vars['exec_path'] = exec_path
+    strace_opts.append("-d")
+    strace_opts.append(exec_path)
+
+    try:
+        pattern = re.compile(r'\s+(/\S+\.so(?:\.\d+)*)')
+
+        stdout, _ = cmd_run(['ldd', exec_path])
+        lines = stdout.split('\n')
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                path = match.groups()[0]
+                dsos[path] = True
+
+        for path in sorted(dsos.keys()):
+            strace_opts.append("-d")
+            strace_opts.append(path)
+
+    except OSError as e:
+        die(f"cannot run the command \"ldd {exec_path}\": {e}\n")
+
+if pid:
+    if master_pid:
+        die("-x <pid> and --master <pid> are exclusive.\n")
+
+    strace_opts.append("-x")
+    strace_opts.append(pid)
+
+    exec_file = f"/proc/{pid}/exe"
+    if not os.path.exists(exec_file):
+        die(f"Nginx process {pid} is not running or you do not have enough permissions\n")
+
+    std_vars['pid_ok'] = gen_pid_test_condition()
+    std_vars['target'] = pid
+
+    if not exec_path:
+        exec_path = os.readlink(exec_file)
+        std_vars['exec_path'] = exec_path
+        strace_opts.append("-d")
+        strace_opts.append(exec_path)
+
+    process_dso(pid)
+
+if master_pid:
+    exec_file = "/proc/{}/exe".format(master_pid)
+    if not os.path.exists(exec_file):
+        die("Nginx process {} is not running or" \
+            "you do not have enough permissions.\n".format(master_pid))
+
+    if not exec_path:
+        exec_path = os.readlink(exec_file)
+        std_vars['exec_path'] = exec_path
+        strace_opts.append("-d")
+        strace_opts.append(exec_path)
+
+    pids = get_child_processes(master_pid)
+    if not pids:
+        die("No child processes found for {}".format(master_pid))
+
+    std_vars['pid_ok'] = gen_pid_test_condition(pids)
+    std_vars['target'] = "".join(pids)
+
+    pid = pids[0]
+    process_dso(pid)
+
+if sample_pid:
+    process_dso(sample_pid)
+
+if not std_vars.get("pid_ok") and exec_path:
+    std_vars["pid_ok"] = "1"
+
+if not std_vars.get("target") and exec_path:
+    std_vars["target"] = "ANY"
+
+if not print_args:
+    for key, value in args.items():
+        std_vars[f"arg_{key}"] = value
+
+strace_src = process_src(infile, src)
+
+if print_args:
+    for name in sorted(used_args.keys()):
+        default = used_args[name]
+        print(f"\t--arg {default}=VALUE")
+
+        if default:
+            print(f" (default: {default})\n")
+        else:
+            print("\n")
+    sys.exit(0)
+
+for key in args.keys():
+    if not used_std_vars.get(f"arg_{key}"):
+        val = args[key]
+        if not val:
+            val = ''
+
+        warn(f"WARNING: arg_{key} is defined by \" --arg {key}={val} \", "
+             "but never used.\n")
+
+verbose_out(f'used libs {used_libs}')
+tmpdir = tempfile.mkdtemp(prefix='stracexx')
+verbose_out(f'tmep dir {tmpdir}')
+for lib, src in used_libs.items():
+    outfile = f"{tmpdir}/{lib}.stp"
+    with open(outfile, 'w') as fp:
+        fp.write(src)
+
+strace_opts.append("-I")
+strace_opts.append(tmpdir)
+
+if shcmd:
+    strace_opts.append("-c")
+    strace_opts.append(shcmd)
+
+cmd = [trace_cmd]
+cmd.extend(quote_sh_args(strace_opts))
+cmd.append('-')
+
+if dump_src:
+    print(strace_src)
+    sys.exit(0)
+
+verbose_out(cmd)
+
+try:
+    strace_src = strace_src.encode('utf-8')
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    strace_proc = p
+
+    p.stdin.write(strace_src)
+    p.stdin.close()
+
+    while True:
+        output = p.stdout.readline()
+        if output == '' and p.poll() is not None:
+            break
+        output = output.rstrip().decode('utf-8')
+        if output != '':
+            print(output)
+
+    rc = p.poll()
+    sys.exit(rc)
+except OSError as e:
+    die(f"Cannot run strace: {e}\n")
